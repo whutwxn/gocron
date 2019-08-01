@@ -1,13 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"github.com/go-redis/redis"
+	"gocron"
 	"os"
 	"time"
-
-	"github.com/jasonlvhit/gocron"
-
-	"github.com/go-redis/redis"
 )
 
 // Run a Redis instance with Docker: docker run --rm -tid -p 6379:6379 redis:alpine
@@ -52,6 +51,8 @@ func (s *locker) Unlock(key string) error {
 // Run the example in different terminals,
 // passing a different name parameter to each
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// Get a locker
 	l := &locker{
 		redis.NewClient(&redis.Options{
@@ -67,7 +68,6 @@ func main() {
 	if len(args) > 0 {
 		arg = args[0]
 	}
-
 	gocron.Every(1).Second().Lock().Do(lockedTask, arg)
-	<-gocron.Start()
+	gocron.Start(ctx) //todo maybe error
 }
