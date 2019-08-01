@@ -20,9 +20,11 @@ package gocron
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"github.com/satori/go.uuid"
+	"log"
 	"reflect"
 	"runtime"
 	"sort"
@@ -54,6 +56,22 @@ type Job struct {
 	funcs    map[string]interface{}     // Map for the function task store
 	fparams  map[string]([]interface{}) // Map for function and  params of function
 	uuid     string                     // uuid for the job
+	lock     bool
+}
+
+// Locker provides a method to lock jobs from running
+// at the same time on multiple instances of gocron.
+// You can provide any locker implementation you wish.
+type Locker interface {
+	Lock(key string) (bool, error)
+	Unlock(key string) error
+}
+
+var locker Locker
+
+// SetLocker sets a locker implementation
+func SetLocker(l Locker) {
+	locker = l
 }
 
 // NewJob creates a new job with the time interval.
@@ -72,20 +90,39 @@ func NewJob(interval uint64) *Job {
 		make(map[string]interface{}),
 		make(map[string]([]interface{})),
 		id,
+		false,
 	}
 }
 
 // True if the job should be run now
 func (j *Job) shouldRun() bool {
-	return time.Now().After(j.nextRun)
+	return time.Now().Unix() >= j.nextRun.Unix()
 }
 
 //Run the job and immediately reschedule it
 func (j *Job) run() (result []reflect.Value, err error) {
+	if j.lock {
+		if locker == nil {
+			err = fmt.Errorf("trying to lock %s with nil locker", j.jobFunc)
+			return
+		}
+		key := getFunctionKey(j.jobFunc)
+
+		if ok, err := locker.Lock(key); err != nil || !ok {
+			return nil, err
+		}
+
+		defer func() {
+			if e := locker.Unlock(key); e != nil {
+				err = e
+			}
+		}()
+	}
+
 	f := reflect.ValueOf(j.funcs[j.jobFunc])
 	params := j.fparams[j.jobFunc]
 	if len(params) != f.Type().NumIn() {
-		err = errors.New("The number of param is not adapted.")
+		err = errors.New("the number of param is not adapted")
 		return
 	}
 	in := make([]reflect.Value, len(params))
@@ -100,7 +137,13 @@ func (j *Job) run() (result []reflect.Value, err error) {
 
 // for given function fn, get the name of function.
 func getFunctionName(fn interface{}) string {
-	return runtime.FuncForPC(reflect.ValueOf((fn)).Pointer()).Name()
+	return runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+}
+
+func getFunctionKey(funcName string) string {
+	h := sha256.New()
+	h.Write([]byte(funcName))
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // Do specifies the jobFunc that should be called every time the job runs
@@ -115,6 +158,17 @@ func (j *Job) Do(jobFun interface{}, params ...interface{}) string {
 	j.jobFunc = fname
 	j.scheduleNextRun()
 	return j.uuid
+}
+
+// DoSafely does the same thing as Do, but logs unexpected panics, instead of unwinding them up the chain
+func (j *Job) DoSafely(jobFun interface{}, params ...interface{}) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("Internal panic occurred: %s", err)
+		}
+	}()
+
+	j.Do(jobFun, params)
 }
 
 func formatTime(t string) (hour, min int, err error) {
@@ -156,11 +210,11 @@ func (j *Job) periodDuration() time.Duration {
 	interval := time.Duration(j.interval)
 	switch j.unit {
 	case "seconds":
-		return time.Duration(interval * time.Second)
+		return interval * time.Second
 	case "minutes":
-		return time.Duration(interval * time.Minute)
+		return interval * time.Minute
 	case "hours":
-		return time.Duration(interval * time.Hour)
+		return interval * time.Hour
 	case "days":
 		return time.Duration(interval * time.Hour * 24)
 	case "weeks":
@@ -182,6 +236,8 @@ func (j *Job) scheduleNextRun() {
 	}
 
 	switch j.unit {
+	case "seconds", "minutes", "hours":
+		j.nextRun = j.lastRun.Add(j.periodDuration())
 	case "days":
 		j.nextRun = j.roundToMidnight(j.lastRun)
 		j.nextRun = j.nextRun.Add(j.atTime)
@@ -193,8 +249,6 @@ func (j *Job) scheduleNextRun() {
 			j.nextRun = j.nextRun.Add(time.Duration(dayDiff) * 24 * time.Hour)
 		}
 		j.nextRun = j.nextRun.Add(j.atTime)
-	default:
-		j.nextRun = j.lastRun
 	}
 
 	// advance to next possible schedule
@@ -212,7 +266,7 @@ func (j *Job) NextScheduledTime() time.Time {
 
 func (j *Job) mustInterval(i uint64) {
 	if j.interval != i {
-		panic(fmt.Sprintf("interval maust be %d", i))
+		panic(fmt.Sprintf("interval must be %d", i))
 	}
 }
 
@@ -314,6 +368,12 @@ func (j *Job) Sunday() *Job {
 	return j.Weekday(time.Sunday)
 }
 
+// Lock prevents job to run from multiple instances of gocron
+func (j *Job) Lock() *Job {
+	j.lock = true
+	return j
+}
+
 // Scheduler struct, the only data member is the list of jobs.
 // - implements the sort.Interface{} for sorting jobs, by the time nextRun
 type Scheduler struct {
@@ -330,7 +390,7 @@ func (s *Scheduler) Swap(i, j int) {
 }
 
 func (s *Scheduler) Less(i, j int) bool {
-	return s.jobs[j].nextRun.After(s.jobs[i].nextRun)
+	return s.jobs[j].nextRun.Second() >= s.jobs[i].nextRun.Second()
 }
 
 // NewScheduler creates a new scheduler
@@ -339,15 +399,13 @@ func NewScheduler() *Scheduler {
 }
 
 // Get the current runnable jobs, which shouldRun is True
-func (s *Scheduler) getRunnableJobs() (running_jobs [MAXJOBNUM]*Job, n int) {
+func (s *Scheduler) getRunnableJobs() (runningJobs [MAXJOBNUM]*Job, n int) {
 	runnableJobs := [MAXJOBNUM]*Job{}
 	n = 0
 	sort.Sort(s)
 	for i := 0; i < s.size; i++ {
 		if s.jobs[i].shouldRun() {
-
 			runnableJobs[n] = s.jobs[i]
-			//fmt.Println(runnableJobs)
 			n++
 		} else {
 			break
@@ -441,7 +499,7 @@ func (s *Scheduler) Remove(j interface{}) {
 		s.jobs[i] = s.jobs[j]
 		i++
 	}
-	s.size = s.size - 1
+	s.size--
 }
 
 // Check if specific job j was already added
